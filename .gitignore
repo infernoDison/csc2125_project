@@ -2,4 +2,5 @@ artifacts/*
 build/*
 __pycache__
 data
-contract_addr.txt
+contract_addrs.json
+*.swp
