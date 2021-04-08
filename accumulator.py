@@ -1,3 +1,4 @@
+import copy
 from eth_utils import (
     keccak,
     remove_0x_prefix,
@@ -12,14 +13,11 @@ class HashTreeEntry:
 
 class NameEntry(HashTreeEntry):
     def __init__(self, name_hash, next_hash, public_key, owner, tree_index):
-
-        # name_hash, next_hash, pub_key are 32 byte hex strings
-        self.name_hash = name_hash
-        self.next_hash = next_hash
-        self.public_key = public_key
-        # owner is a 20 byte hex string (Ethereum address)
-        self.owner = owner
-        self.tree_index = tree_index
+        self.name_hash = name_hash      # bytes32 (hex string)
+        self.next_hash = next_hash      # bytes32 (hex string)
+        self.public_key = public_key    # bytes32 (hex string)
+        self.owner = owner              # address (20 byte hex string)
+        self.tree_index = tree_index    # uint256
 
         self.update_entry_hash()
 
@@ -29,6 +27,16 @@ class NameEntry(HashTreeEntry):
             self.name_hash + self.next_hash + self.public_key + self.owner + \
             remove_0x_prefix(hex_encode_abi_type("uint256", self.tree_index))
         )).hex()
+
+
+    def get_formatted_tuple(self):
+        return (
+            self.name_hash,
+            self.next_hash,
+            self.public_key,
+            '0x' + self.owner,
+            self.tree_index
+        )
 
 
 
@@ -114,92 +122,127 @@ class Accumulator:
                        (this should never happen)"
 
 
-    def acc_modify_entry(self, public_key, entry_index):
+    def acc_modify_entry(self, name_hash, public_key):
         """
         Change the public key associated with an entry.
         """
 
-        entry = self._entries[entry_index]
+        entry, entry_index = self.acc_find_entry(name_hash)
+
+        assert (name_hash == entry.name_hash), \
+               f"No entry found for name hash {name_hash}"
+
+        entries = []
         proofs = []
 
         # Membership proof for entry
+        entries.append(entry.get_formatted_tuple())
         proofs.append(self.tree_get_proof(entry.tree_index))
         entry.public_key = public_key
         self._tree_update(entry)
 
-        return proofs
+        return entries, proofs
 
 
-    def acc_add_entry(self, name_hash, public_key, owner, entry_index):
+    def acc_add_entry(self, name_hash, public_key, owner):
         """
         Add a new entry to the accumulator.
         The sending account is recorded as the owner in the smart contract.
         """
 
-        entry = self._entries[entry_index]
-        assert (name_hash > entry.name_hash and name_hash < entry.next_hash), \
-               f"Name hash {name_hash} does not lie in entry {entry_index}"
+        split_entry, split_index = self.acc_find_entry(name_hash)
+        sibling_entry = self._hash_tree[len(self._hash_tree)//2]
 
+        assert (name_hash != split_entry.name_hash), \
+               f"Name hash {name_hash} is already registered"
+        assert (name_hash > split_entry.name_hash and name_hash < split_entry.next_hash), \
+               f"Non-membership entry for name hash {name_hash} is invalid"
+
+        new_entry = NameEntry(name_hash, split_entry.next_hash, public_key,
+                              owner, len(self._hash_tree)+1)
+
+        entries = []
         proofs = []
 
         # Split interval in two
         # Operation 1: Update old entry to be lower half of interval
         # Non-membership proof for name hash
-        proofs.append(self.tree_get_proof(entry.tree_index))
-        temp_next_hash = entry.next_hash
-        entry.next_hash = name_hash
-        self._tree_update(entry)
+        entries.append(split_entry.get_formatted_tuple())
+        proofs.append(self.tree_get_proof(split_entry.tree_index))
+        split_entry.next_hash = name_hash
+        self._tree_update(split_entry)
 
         # Operation 2: Append new entry containing upper half of interval
         # Membership proof for parent of to-be-appended entry
-        proofs.append(self.tree_get_proof(len(self._hash_tree)//2))
-        new_entry = NameEntry(name_hash, temp_next_hash, public_key, owner, len(self._hash_tree)+1)
-        self._entries.insert(entry_index+1, new_entry)
+        entries.append(sibling_entry.get_formatted_tuple())
+        proofs.append(self.tree_get_proof(sibling_entry.tree_index))
+        self._entries.insert(split_index+1, new_entry)
         self._tree_append(new_entry)
 
-        return proofs
+        return entries, proofs
 
 
-    def acc_delete_entry(self, public_key, entry_index):
+    def acc_delete_entry(self, name_hash):
         """
         Delete an entry from the accumulator.
         Only the owner recorded in the smart contract is allowed to do this.
         """
 
-        assert (entry_index != 0), "Can not delete placeholder entry"
-
-        entry = self._entries[entry_index]
-        prev_entry = self._entries[entry_index-1]
+        entry, entry_index = self.acc_find_entry(name_hash)
+        merge_entry = self._entries[entry_index-1]
         last_entry = self._hash_tree[-1]
 
+        assert (name_hash == entry.name_hash), \
+               f"No entry found for name hash {name_hash}"
+        assert (entry_index != 0), "Can not delete placeholder entry"
+
+        entries = []
         proofs = []
 
         # Merge intervals
         # Operation 1: Update preceding entry to be entire interval
         # Membership proof for preceding entry
-        proofs.append(self.tree_get_proof(prev_entry.tree_index))
-        prev_entry.next_hash = entry.next_hash
-        self._tree_update(prev_entry)
+        entries.append(merge_entry.get_formatted_tuple())
+        proofs.append(self.tree_get_proof(merge_entry.tree_index))
+        merge_entry.next_hash = entry.next_hash
+        self._tree_update(merge_entry)
 
         # Operation 2: Move last entry into tree location of current entry
         # This does nothing if the current entry is the last entry
         # Membership proof for current entry
+        entries.append(entry.get_formatted_tuple())
         proofs.append(self.tree_get_proof(entry.tree_index))
+        # Move the reference since self._entries points to last_entry
+        temp_last_entry = copy.copy(last_entry)
         last_entry.tree_index = entry.tree_index
-        self._hash_tree[entry_index] = last_entry
+        self._hash_tree[-1] = temp_last_entry
+        self._hash_tree[entry.tree_index] = last_entry
         self._tree_update(last_entry)
-        self._entries.pop(entry_index)
 
         # Operation 3: Delete last entry
-        # Membership proof for last entry
-        proofs.append(self.tree_get_proof(len(self._hash_tree)-1))
+        # Membership proof for last entry and its sibling
+        entries.append(self._hash_tree[-1].get_formatted_tuple())
+        entries.append(self._hash_tree[-2].get_formatted_tuple())
+        proofs.append(self.tree_get_proof(len(self._entries)-1))
         self._tree_delete_last()
+        self._entries.pop(entry_index)
 
-        return proofs
+        return entries, proofs
 
 
+    def print_state(self):
+        print("Entries")
+        for entry in self._entries:
+            print(entry)
+            print(entry.get_formatted_tuple())
 
-def tree_verify_proof(proof, tree_index, entry_hash, tree_root):
+        print("Hash tree")
+        for i in range(len(self._hash_tree)):
+            print("" + str(i) + "\t" + self._hash_tree[i].entry_hash + \
+                  "\t" + str(self._hash_tree[i]))
+
+
+def tree_calc_root(entry_hash, proof, tree_index):
     for sibling in proof:
         if (tree_index % 2 == 0):
             entry_hash = keccak(hexstr=(entry_hash + sibling)).hex()
@@ -207,5 +250,5 @@ def tree_verify_proof(proof, tree_index, entry_hash, tree_root):
             entry_hash = keccak(hexstr=(sibling + entry_hash)).hex()
         tree_index //= 2
 
-    return (entry_hash == tree_root)
+    return entry_hash
 
